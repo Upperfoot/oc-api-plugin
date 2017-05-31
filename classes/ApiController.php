@@ -2,14 +2,15 @@
 
 namespace Autumn\Api\Classes;
 
-use Validator;
-use League\Fractal\Manager;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
-use League\Fractal\Resource\Item;
 use Illuminate\Routing\Controller;
+use League\Fractal\Manager;
 use League\Fractal\Pagination\Cursor;
 use League\Fractal\Resource\Collection;
+use League\Fractal\Resource\Item;
+use League\Fractal\Serializer\ArraySerializer;
+use Validator;
 
 abstract class ApiController extends Controller
 {
@@ -32,7 +33,7 @@ abstract class ApiController extends Controller
      *
      * @var \Illuminate\Database\Eloquent\Model;
      */
-    protected $model;
+    protected $tempModel;
 
     /**
      * Fractal Transformer instance.
@@ -83,6 +84,20 @@ abstract class ApiController extends Controller
      * @var string
      */
     protected $resourceKeyPlural = 'data';
+    
+    /**
+     *
+     *
+     * @var array
+     */
+    protected $searchableFields = [];
+    
+    /**
+     *
+     *
+     * @var array
+     */
+    protected $filterableFields = [ 'id' ];
 
     /**
      * Constructor.
@@ -91,7 +106,6 @@ abstract class ApiController extends Controller
      */
     public function __construct(Request $request)
     {
-        $this->model = $this->model();
         $this->transformer = $this->transformer();
 
         $this->fractal = new Manager();
@@ -127,7 +141,196 @@ abstract class ApiController extends Controller
     {
         return new ArraySerializer();
     }
-
+    
+    /** 
+     * This is a temporary fix for getting a new model
+     * as loading it in the constructor is too early for the events
+     * to be bound.
+     */
+    public function __get ( $name )
+    {
+        if($name == "model") {
+            if(!empty($this->tempModel)) {
+                return $this->tempModel;
+            } else {
+                return $this->tempModel = $this->model();
+            }
+        }
+    }
+    
+    /** 
+     * This is a temporary fix for getting a new model
+     * as loading it in the constructor is too early for the events
+     * to be bound.
+     */
+    public function __set ( $name , $value)
+    {
+        if($name == "model") {
+            $this->tempModel = $value;
+        }
+    }
+    
+    public function searchFields($model)
+    {
+        $searchQuery = $this->request->input('search', '');
+        
+        if(!empty($this->searchableFields) && !empty($searchQuery)) {
+            $searchableFields = $this->searchableFields;
+            
+            $sameScope = [];
+            
+            foreach($searchableFields as $field) {
+                $explode = explode(".", $field);
+                $theField = array_pop($explode);
+                
+                $scope = implode(".", $explode);
+                
+                if(empty($sameScope[$scope])) {
+                    $sameScope[$scope] = [];
+                }
+                
+                $sameScope[$scope][] = $theField;
+            }
+            
+            $model->where(function($q) use ($sameScope, $searchQuery) {
+                foreach($sameScope as $scope=>$fields) {
+                    if(empty($scope)) {
+                        $q->orWhere(function($q2) use($fields, $scope, $searchQuery) {
+                            foreach($fields as $field) {
+                                //This is to stop ambiguous fields
+                                $table = $q2->getQuery()->from;
+                                
+                                $q2->orWhere($table . "." . $field, 'LIKE', '%' . $searchQuery . '%');
+                            }
+                        });
+                    } else {
+                        $q->orWhereHas($scope, function($q2) use($fields, $scope, $searchQuery) {
+                            $q2->where(function($q3) use ($fields, $searchQuery) {
+                                //This is to stop ambiguous fields
+                                $table = $q3->getQuery()->from;
+                
+                                foreach($fields as $field) {
+                                    $q3->orWhere($table . "." . $field, 'LIKE', '%' . $searchQuery . '%');
+                                }
+                            });
+                        });
+                    }
+                }
+            });
+        }
+        
+        return $model;
+    }
+    
+    public function filterFields($model)
+    {
+        if(!empty($this->filterableFields)) {
+            
+            
+            $filterableFields = $this->filterableFields;
+            
+            $sameScope = [];
+            
+            foreach($filterableFields as $field) {
+                
+                //This is because http_build_query replaces dots in parameters to underscores.
+                $convertedFieldName = str_replace(".", "_", $field);
+                $filterQuery =  $this->request->input($convertedFieldName, '');
+				
+                if(!is_numeric($filterQuery) && empty($filterQuery)) {
+                    continue;
+                }
+                
+                $explode = explode(".", $field);
+                $theField = array_pop($explode);
+                
+                $scope = implode(".", $explode);
+                
+                if(empty($sameScope[$scope])) {
+                    $sameScope[$scope] = [];
+                }
+                
+                $filterQueryValues = explode(",", $filterQuery);
+                
+                $sameScope[$scope][$theField] = $filterQueryValues;
+            }
+            
+            $model->where(function($q) use ($sameScope) {
+                foreach($sameScope as $scope=>$fields) {
+                    if(empty($scope)) {
+                        foreach($fields as $field=>$fieldQuery) {
+                            
+                            //This is to stop ambiguous fields
+                            $table = $q->getQuery()->from;
+							
+                            if(is_array($fieldQuery)) {
+                                $q->whereIn($table . "." . $field, $fieldQuery);
+                            } else {
+                                $q->where($table . "." . $field, $fieldQuery);
+                            }
+                        }
+                    } else {
+                        $q->whereHas($scope, function($q2) use($fields, $scope) {
+                                //This is to stop ambiguous fields
+                                $table = $q2->getQuery()->from;
+                                
+                                foreach($fields as $field=>$fieldQuery) {
+                                    if(is_array($fieldQuery)) {
+                                        $q2->whereIn($table . "." . $field, $fieldQuery);
+                                    } else {
+                                        $q2->where($table . "." . $field, $fieldQuery);
+                                    }
+                                }
+                        });
+                    }
+                }
+            });
+        }
+    }
+    
+    public function sortField($model)
+    {
+        $sortQuery = $this->request->input('sort', '');
+        
+        if(!empty($sortQuery)) {
+            
+            //strip whitespace, explode on comma delimited fields
+            $sortableFields = explode(',', preg_replace('/\s+/', '', $sortQuery));
+            
+            foreach($sortableFields as $sortableFieldSplit)
+            {
+                $explodedFields = explode('-', $sortableFieldSplit);
+                $sortableField = array_pop($explodedFields);
+                
+                //if explodedfields is greater than 0 then we have defined a minus
+                if(count($explodedFields) > 0) {
+                    $sort = "DESC";
+                } else {
+                    $sort = "ASC";
+                }
+                
+                if($model instanceof \Illuminate\Database\Eloquent\Relations\Relation) {
+                    $table = $model->getQuery()->getQuery()->from;
+                } else {
+                    $table = $model->getQuery()->from;
+                }
+                
+                $columns = \Schema::getColumnListing($table);
+                
+                $sortField = in_array($sortableField, $columns) ? $table . "." . $sortableField : $sortableField;
+                
+                //This is to stop ambiguous fields
+                $model->orderBy(\DB::raw('`'.$sortableField.'`'), $sort);
+                
+            }
+        }
+    }
+    
+    public function defaultQuery($query)
+    {
+        return $query;
+    }
+    
     /**
      * Display a listing of the resource.
      * GET /api/{resource}.
@@ -137,14 +340,19 @@ abstract class ApiController extends Controller
     public function index()
     {
         $with = $this->getEagerLoad();
-        $skip = (int) $this->request->input('skip', 0);
+        $skip = (int) $this->request->input('offset', 0);
         $limit = $this->calculateLimit();
 
         $items = $limit
-            ? $this->model->with($with)->skip($skip)->limit($limit)->get()
-            : $this->model->with($with)->get();
+            ? $this->model->with($with)->skip($skip)->limit($limit)
+            : $this->model->with($with);
+        
+        $this->defaultQuery($items);
+        $this->filterFields($items);
+        $this->searchFields($items);
+        $this->sortField($items);
 
-        return $this->respondWithCollection($items, $skip, $limit);
+        return $this->respondWithCollection($items->get(), $skip, $limit);
     }
 
     /**
@@ -157,7 +365,7 @@ abstract class ApiController extends Controller
     {
         $data = $this->request->json()->get($this->resourceKeySingular);
 
-        if (! $data) {
+        if (!$data) {
             return $this->errorWrongArgs('Empty data');
         }
 
@@ -186,7 +394,8 @@ abstract class ApiController extends Controller
         $with = $this->getEagerLoad();
 
         $item = $this->findItem($id, $with);
-        if (! $item) {
+        
+        if (!$item) {
             return $this->errorNotFound();
         }
 
@@ -205,12 +414,12 @@ abstract class ApiController extends Controller
     {
         $data = $this->request->json()->get($this->resourceKeySingular);
 
-        if (! $data) {
+        if (!$data) {
             return $this->errorWrongArgs('Empty data');
         }
 
         $item = $this->findItem($id);
-        if (! $item) {
+        if (!$item) {
             return $this->errorNotFound();
         }
 
@@ -239,7 +448,7 @@ abstract class ApiController extends Controller
     {
         $item = $this->findItem($id);
 
-        if (! $item) {
+        if (!$item) {
             return $this->errorNotFound();
         }
 
@@ -357,7 +566,7 @@ abstract class ApiController extends Controller
     {
         return $this->respond([
             'error' => [
-                'message' => $message,
+                'messages'     => $message,
                 'status_code' => $this->statusCode,
             ],
         ]);
@@ -446,6 +655,18 @@ abstract class ApiController extends Controller
     }
 
     /**
+     * Generate a Response with a 409 HTTP header and a given message.
+     *
+     * @param string $message
+     *
+     * @return Response
+     */
+    protected function errorExists($message = 'Resource already exists')
+    {
+        return $this->setStatusCode(Response::HTTP_CONFLICT)->respondWithError($message);
+    }
+
+    /**
      * Generate a Response with a 405 HTTP header and a given message.
      *
      * @param string $message
@@ -503,11 +724,14 @@ abstract class ApiController extends Controller
      */
     protected function findItem($id, array $with = [])
     {
+        $query = $this->model->with($with);
+        $this->defaultQuery($query);
+        
         if ($this->request->has('use_as_id')) {
-            return $this->model->with($with)->where($this->request->input('use_as_id'), '=', $id)->first();
+            return $query->where($this->request->input('use_as_id'), '=', $id)->first();
         }
-
-        return $this->model->with($with)->find($id);
+        
+        return $query->find($id);
     }
 
     /**
