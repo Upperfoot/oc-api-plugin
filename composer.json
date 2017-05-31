@@ -1,5 +1,6 @@
 {
     "name": "autumn/api",
+    "type": "october-plugin",
     "description": "Api plugin for OctoberCMS",
     "homepage": "https://github.com/gpasztor87/oc-api-plugin",
     "license": "MIT",
